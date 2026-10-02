@@ -23,6 +23,7 @@ import (
 	"net"
 	"net/http"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -32,18 +33,17 @@ import (
 )
 
 func TestSetMaxHeaderValueCount(t *testing.T) {
-	server := &http.Server{MaxHeaderBytes: 1 << 20, ReadHeaderTimeout: time.Second}
-	before := *server
-	setMaxHeaderValueCount(server)
-	field := reflect.ValueOf(server).Elem().FieldByName("MaxHeaderValueCount")
-	if field.IsValid() {
-		if got := field.Int(); got != 8192 {
-			t.Fatalf("MaxHeaderValueCount = %d, want 8192", got)
-		}
-		field.SetInt(reflect.ValueOf(before).FieldByName("MaxHeaderValueCount").Int())
+	newServer := func() *http.Server {
+		return &http.Server{MaxHeaderBytes: 1 << 20, ReadHeaderTimeout: time.Second}
 	}
-	if !reflect.DeepEqual(*server, before) {
-		t.Fatal("helper changed other server configuration")
+	server := newServer()
+	setMaxHeaderValueCount(server)
+	want := newServer()
+	if field := reflect.ValueOf(want).Elem().FieldByName("MaxHeaderValueCount"); field.IsValid() {
+		field.SetInt(8192)
+	}
+	if !reflect.DeepEqual(server, want) {
+		t.Fatalf("server = %+v, want %+v", server, want)
 	}
 }
 
@@ -123,15 +123,20 @@ func TestServingIdentityHeaders(t *testing.T) {
 					t.Fatal(err)
 				}
 				resp.Body.Close()
-				want := http.StatusOK
-				// This dependency's x/net HTTP/2 server predates the Go 1.27 wrapper.
-				if hasCountLimit && !tc.http2 && count > 8192 {
-					want = http.StatusRequestHeaderFieldsTooLarge
+				wantStatus := []int{http.StatusOK}
+				if hasCountLimit && count > 8192 {
+					if tc.http2 {
+						// Older golang.org/x/net HTTP/2 servers do not count header values;
+						// newer ones apply MaxHeaderValueCount as net/http does.
+						wantStatus = append(wantStatus, http.StatusRequestHeaderFieldsTooLarge)
+					} else {
+						wantStatus = []int{http.StatusRequestHeaderFieldsTooLarge}
+					}
 				}
-				if resp.ProtoMajor != tc.protocol || resp.StatusCode != want {
-					t.Errorf("%d values: status/protocol = %d/%s, want %d/HTTP%d", count, resp.StatusCode, resp.Proto, want, tc.protocol)
+				if resp.ProtoMajor != tc.protocol || !slices.Contains(wantStatus, resp.StatusCode) {
+					t.Errorf("%d values: status/protocol = %d/%s, want one of %v/HTTP%d", count, resp.StatusCode, resp.Proto, wantStatus, tc.protocol)
 				}
-				if want == http.StatusOK && resp.Header.Get("X-Received-Group-Count") != fmt.Sprint(count) {
+				if resp.StatusCode == http.StatusOK && resp.Header.Get("X-Received-Group-Count") != fmt.Sprint(count) {
 					t.Errorf("handler received %q group values, want %d", resp.Header.Get("X-Received-Group-Count"), count)
 				}
 			}
